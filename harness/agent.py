@@ -153,6 +153,24 @@ REPORT_KEYS = ("answer", "claims", "abstain", "citations")
 #: finish. After this many deferrals the FINAL is taken at face value.
 MAX_FINAL_DEFERRALS = 2
 
+#: Số lần tối đa một lượt chạy từ chối FINAL viết khi CHƯA có quan sát tool
+#: nào. Đo trên bảng xếp hạng vòng chấm (model thật, prompt gốc): hầu hết
+#: bài nộp dừng ở `single_model_call` — model abstain ngay lượt 1, 0 tool
+#: call, mọi layer không có gì để làm, mọi bài cùng 39.47. MockModel luôn
+#: search trước nên guard này không bao giờ bắn trên vòng luyện tập.
+MAX_EARLY_FINAL_NUDGES = 2
+
+#: Lời nhắc khi model kết luận trước khi tìm. Cố tình KHÔNG chứa
+#: `FINALIZE_SENTINEL`: ở đây ta muốn nó gọi công cụ, không phải dừng.
+EARLY_FINAL_NUDGE = (
+    "Bạn chưa gọi công cụ nào nên chưa được phép kết luận, kể cả kết luận là "
+    "không đủ căn cứ. Câu hỏi thường không dùng cùng từ ngữ với tài liệu: hãy "
+    "gọi search bằng thuật ngữ nội bộ (tên chính sách, quy trình, phòng ban), "
+    "rồi fetch_doc tài liệu phù hợp nhất để đọc toàn văn, sau đó mới viết FINAL "
+    "với các claims là câu chép nguyên văn từ tài liệu. Lượt này chỉ trả lời "
+    "bằng THOUGHT và ACTION."
+)
+
 #: What a model writes where CONTENT belongs when it is QUOTING the
 #: protocol instead of answering: the template's own `...`, an ellipsis,
 #: a dash, or an `<angle-bracket slot>`.
@@ -487,6 +505,7 @@ class ReActAgent:
         # belongs to the layers.
         self._final_deferrals = 0
         self._refused_final: dict | None = None
+        self._early_final_nudges = 0
 
     # -- the run -------------------------------------------------------
 
@@ -503,6 +522,7 @@ class ReActAgent:
         self.last_context = ctx
         self._final_deferrals = 0
         self._refused_final = None
+        self._early_final_nudges = 0
 
         self.trace.emit("agent_start", brief_id=str(brief.get("brief_id", "")))
 
@@ -532,7 +552,18 @@ class ReActAgent:
             ctx.messages.append({"role": "assistant", "content": text})
 
             if parsed.kind == "final":
-                report = parsed.final if isinstance(parsed.final, dict) else {}
+                final = parsed.final if isinstance(parsed.final, dict) else {}
+                if not ctx.observations and self._early_final_nudges < MAX_EARLY_FINAL_NUDGES:
+                    # FINAL khi CHƯA gọi tool nào: model thật hay abstain
+                    # ngay lượt 1 (cờ `single_model_call` trên bảng xếp
+                    # hạng). Bắt nó search trước. FINAL này được giữ làm
+                    # dự phòng, nên guard chỉ mua thêm lượt, không làm mất
+                    # report.
+                    self._early_final_nudges += 1
+                    self._refused_final = final
+                    ctx.messages.append({"role": "user", "content": EARLY_FINAL_NUDGE})
+                    continue
+                report = final
                 ctx.stop_reason = "final"
                 break
 

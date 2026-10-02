@@ -70,7 +70,56 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import re
+import unicodedata
+
 from harness.middleware import Middleware
+
+_WS_RE = re.compile(r"\s+")
+
+#: Liên từ mô hình dùng để dán hai nửa câu của hai tài liệu (trường hợp (c)).
+GLUE = " và "
+
+#: Scorer coi câu ngắn hơn ngần này là không trích dẫn được (MIN_SUPPORT_CHARS).
+MIN_CHARS = 12
+
+ABSTAIN_ANSWER = "Không đủ căn cứ trong các tài liệu đã đọc để trả lời câu hỏi này."
+
+
+def _norm(text: str) -> str:
+    """Cùng phép chuẩn hoá scorer dùng khi so khớp: NFC, casefold, gộp khoảng trắng."""
+    return _WS_RE.sub(" ", unicodedata.normalize("NFC", text).casefold()).strip()
+
+
+def _in_evidence(text: str, observed_lines: list) -> bool:
+    """`text` có xuất hiện nguyên văn trong MỘT dòng bằng chứng đã đọc không."""
+    needle = _norm(text)
+    return len(needle) >= MIN_CHARS and any(needle in line for line in observed_lines)
+
+
+def _source(ctx, text: str):
+    """doc_id của tài liệu đã về nguyên vẹn (fetch sạch) chứa `text` trong một dòng."""
+    if ctx.corpus is None:
+        return None
+    needle, observed = _norm(text), ctx.observed_text
+    for doc in ctx.corpus.docs:
+        if doc.body in observed and any(needle in _norm(l) for l in doc.body.splitlines()):
+            return doc.doc_id
+    return None
+
+
+def _split_fused(ctx, text: str, observed_lines: list) -> list:
+    """Tách câu ghép tại chỗ dán: cả hai nửa phải có trong bằng chứng và thuộc
+    HAI tài liệu khác nhau. Mỗi nửa là substring của chữ mô hình — hợp lệ."""
+    start = text.find(GLUE)
+    while start >= 0:
+        left, right = text[:start].strip(), text[start + len(GLUE):].strip()
+        if _in_evidence(left, observed_lines) and _in_evidence(right, observed_lines):
+            left_doc, right_doc = _source(ctx, left), _source(ctx, right)
+            if left_doc and right_doc and left_doc != right_doc:
+                return [{"text": left, "doc_id": left_doc}, {"text": right, "doc_id": right_doc}]
+        start = text.find(GLUE, start + 1)
+    return []
 
 
 class Critic(Middleware):
@@ -79,16 +128,40 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if not isinstance(report, dict):
+            return report
+        # 1. Lấy claims. Danh sách rỗng/hỏng đi thẳng xuống bước 5 (abstain):
+        #    một report không claim, không abstain bị chấm 0 điểm.
+        claims = report.get("claims")
+        claims = claims if isinstance(claims, list) else []
+        observed_lines = [l for l in (_norm(r) for r in ctx.observed_text.splitlines()) if l]
+
+        kept = []
+        for claim in claims:
+            text = claim.get("text") if isinstance(claim, dict) else None
+            if not isinstance(text, str):
+                continue
+            # 2. Có nguyên văn trong bằng chứng -> giữ, KHÔNG sửa chữ.
+            if _in_evidence(text, observed_lines):
+                kept.append(claim)
+                continue
+            # 3. Câu ghép từ hai tài liệu -> giữ hai nửa, đặt abstain.
+            halves = _split_fused(ctx, text, observed_lines)
+            if halves:
+                kept.extend(halves)
+                report["abstain"] = True
+            # 4. Không tách được -> bịa: bỏ.
+
+        # 5. Không còn gì -> abstain, nói rõ là không đủ căn cứ.
+        if not kept:
+            report.update(abstain=True, claims=[], citations=[], answer=ABSTAIN_ANSWER)
+            ctx.state["critic_kept"] = 0
+            return report
+
+        # 6. Citations khớp với claims còn lại.
+        report["claims"] = kept
+        report["citations"] = sorted(
+            {c["doc_id"] for c in kept if isinstance(c.get("doc_id"), str)}
+        )
+        ctx.state["critic_kept"] = len(kept)
+        return report

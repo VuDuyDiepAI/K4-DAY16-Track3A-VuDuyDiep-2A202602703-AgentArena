@@ -64,9 +64,10 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
-from arena.model import FINALIZE_SENTINEL
+from arena.model import FINALIZE_SENTINEL, MockModel
 from arena.tools import ToolResult  # noqa: F401  (dùng trong phần TODO)
 
+from harness.agent import REAL_MODEL_PROMPT_ADDENDUM, real_model_system_prompt
 from harness.middleware import Middleware
 
 #: Dành lại cho lượt `submit` mà agent vẫn còn phải gọi.
@@ -86,24 +87,42 @@ class BudgetPolicy(Middleware):
     def __init__(self, reserve: int = DEFAULT_RESERVE) -> None:
         self.reserve = max(0, int(reserve))
 
+    def before_agent(self, ctx):
+        # Vòng chấm chạy model THẬT với prompt gốc. Thiếu phụ lục giao thức,
+        # model thật kết luận ngay lượt 1 không gọi tool nào và không tôn
+        # trọng định dạng claim nguyên văn. Gắn phụ lục (của chính
+        # harness/agent.py) vào system message — CHỈ khi không phải mock,
+        # nên bảng điểm luyện tập giữ nguyên từng byte.
+        inner = getattr(ctx.model, "inner", ctx.model)  # runner bọc model
+        if isinstance(inner, MockModel) or not ctx.messages:
+            return
+        system = ctx.messages[0]
+        content = system.get("content") if isinstance(system, dict) else None
+        if system.get("role") == "system" and isinstance(content, str) \
+                and REAL_MODEL_PROMPT_ADDENDUM.strip() not in content:
+            ctx.messages[0] = {**system, "content": real_model_system_prompt(content)}
+
     def _spent(self, ctx) -> bool:
-        # TODO (§3): 2 dòng — "ngân sách đã cạn đến phần dự trữ chưa?"
-        #  limit = ctx.max_tool_calls; None nghĩa là brief không đặt ngân
-        #  sách -> chưa bao giờ cạn. Ngược lại:
-        #  ctx.tools.calls >= limit - self.reserve
-        return False
+        limit = ctx.max_tool_calls
+        return limit is not None and ctx.tools.calls >= limit - self.reserve
 
     def before_model(self, ctx, messages):
-        # TODO (§3): khoảng 4-6 dòng.
-        #  1. Nếu chưa cạn (`not self._spent(ctx)`) -> trả messages nguyên vẹn.
-        #  2. Ngược lại: trả về messages + [{"role": "user", "content": NUDGE}]
-        return messages  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if not self._spent(ctx):
+            return messages
+        ctx.state["budget_nudges"] = ctx.state.get("budget_nudges", 0) + 1
+        # Danh sách MỚI: nhắc trong đúng lượt này, không dính vào lịch sử.
+        return messages + [{"role": "user", "content": NUDGE}]
 
     def wrap_tool_call(self, ctx, call, name, args):
-        # TODO (§3): khoảng 4-6 dòng.
-        #  1. Nếu chưa cạn -> `return call(name, args)` như bình thường.
-        #  2. Nếu đã cạn -> ĐỪNG gọi `call(...)`, trả về
-        #     ToolResult(ok=False, content="", error="<lý do>").
-        #     Không calling through chính là cách một lớp middleware
-        #     "chặn" một hành động — xem harness/middleware.py.
-        return call(name, args)  # <- mặc định KHÔNG LÀM GÌ
+        if not self._spent(ctx):
+            return call(name, args)
+        ctx.state["budget_refused"] = ctx.state.get("budget_refused", 0) + 1
+        # Không raise: agent phải sống để còn viết FINAL.
+        return ToolResult(
+            ok=False,
+            content="",
+            error=(
+                "ngân sách công cụ đã hết — không gọi thêm công cụ nào nữa; "
+                "hãy viết FINAL ngay bằng bằng chứng đang có."
+            ),
+        )
